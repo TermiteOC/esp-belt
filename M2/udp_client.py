@@ -1,37 +1,56 @@
-import socket
-import json
-import time
+import socket, json, threading, time, select
 
-ESP_IP = "IP da esp (esp_netif_handler)"  # IP CORRIGIDO
+ESP_IP = "IP da esp (log vscode)"
 PORT = 10421
+PC_IP = "IP do ipconfig"
 
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5) 
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((PC_IP, PORT))
+sock.setblocking(False)
 
-print(f"Cliente UDP ativo. Endereço do Servidor ESP: {ESP_IP}:{PORT}")
+def display_full_report(data):
+    try:
+        j = json.loads(data)
+        if j.get("type") != "full_report": return
+        print(f"\n=== REPORT ({time.strftime('%H:%M:%S')}) ===")
+        print(f"RPM={j['rpm']:.1f} | SET={j['set_rpm']:.1f} | POS={j['pos']:.1f}mm | CPU={j['cpu_pct']:.1f}%")
+    except:
+        pass
 
-# COMANDOS CORRIGIDOS E NO FORMATO ESPERADO PELO C:
-commands_to_test = ["status", "estop_on", "set_rpm 150.0", "estop_reset"]
-
-try:
-    for msg in commands_to_test:
-        # Nota: O script Python já adiciona '\n' no final
-        s.sendto((msg + "\n").encode(), (ESP_IP, PORT)) 
-        print(f"\nPC > Sent: {msg}")
+def listener():
+    """Thread que escuta relatórios e respostas da ESP."""
+    while True:
         try:
-            data, server_addr = s.recvfrom(1024)
-            data = data.decode()
-            
-            print(f"ESP> Received from {server_addr}: {data.strip()}")
-            try:
-                print("JSON:", json.loads(data))
-            except json.JSONDecodeError:
-                pass
+            r, _, _ = select.select([sock], [], [], 0.2)
+            if r:
+                data, _ = sock.recvfrom(2048)
+                display_full_report(data.decode().strip())
+        except Exception:
+            pass
 
-        except socket.timeout:
-            print("ESP> TIMEOUT: Nenhuma resposta recebida do Servidor UDP.")
+def sender():
+    """Thread que lê comandos do teclado e envia para ESP."""
+    while True:
+        cmd = input("\nDigite comando (status, estop_on, estop_reset, set_rpm X, ping, sair): ").strip()
+        if cmd.lower() in ("exit", "sair"):
+            print("Encerrando cliente...")
+            sock.close()
+            break
+        sock.sendto((cmd + "\n").encode(), (ESP_IP, PORT))
+
+def ping_test(n=5):
+    for i in range(n):
+        t1 = time.time()
+        sock.sendto(b"ping\n", (ESP_IP, PORT))
+        r, _, _ = select.select([sock], [], [], 2)
+        if r:
+            data, _ = sock.recvfrom(1024)
+            t2 = time.time()
+            print(f"Ping {i+1}: RTT={(t2-t1)*1000:.2f} ms -> {data.decode().strip()}")
+        else:
+            print(f"Ping {i+1}: sem resposta")
         time.sleep(1)
-        
-finally:
-    print("Fechando o socket UDP...")
-    s.close()
+
+print(f"Cliente UDP ativo em {PC_IP}:{PORT} → ESP {ESP_IP}:{PORT}")
+threading.Thread(target=listener, daemon=True).start()
+sender()
