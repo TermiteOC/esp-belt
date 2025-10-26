@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -17,48 +18,47 @@
 #include "esp_sntp.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "driver/gpio.h"
 
 #define TAG "ESTEIRA"
 
 // ===== Configuração de rede =====
-#define WIFI_SSID "Nome do Wifi"
-#define WIFI_PASS "Senha do Wifi"
+#define WIFI_SSID "Nome do wifi"
+#define WIFI_PASS "Senha do wifi"
 #define TCP_PORT 10420 // qualquer número entre 0 e 65535
 #define PC_IP 	"IP do ipconfig"
 #define UDP_PORT 10421 // qualquer número entre 0 e 65535
+#define REPORT_PORT 10421 // Porta onde o PC Servidor de Logs (Monitor Task) estará escutando
 #define MAX_PAYLOAD_SIZE 1024 // Define um tamanho máximo para a mensagem de rede
 
-// ===== Mapas dos touch pads =====
-// TP_OBJ -> Touch B: detecta objeto (para acionar desviador)
-// TP_HMI -> Touch C: solicita atualização de HMI/telemetria
-// TP_ESTOP -> Touch D: E-stop (emergência)
 #define TP_OBJ 	TOUCH_PAD_NUM0 	// GPIO4
 #define TP_HMI 	TOUCH_PAD_NUM3 	// GPIO15
-#define TP_ESTOP TOUCH_PAD_NUM7 	// GPIO27
+#define TP_ESTOP TOUCH_PAD_NUM7 // GPIO27
+#define LED_PIN GPIO_NUM_2      // LED
 
 // ===== Configurações de prioridade e stack =====
-#define ENC_T_MS 	5 	 	// período task enc_sense (ms)
-#define PRIO_ESTOP 5
-#define PRIO_ENC 	4
-#define PRIO_CTRL 	3
-#define PRIO_SORT 	2
-#define PRIO_REP 	1 	 	// task de relatório
-#define PRIO_TIME 	1
-#define PRIO_TCP 	5
-#define PRIO_UDP 	5
-#define STK 	 	4096 	// tamanho de stack (bytes)
+#define ENC_T_MS 	 5 	 	// período task enc_sense (ms)
+#define PRIO_ESTOP   5
+#define PRIO_ENC 	 4
+#define PRIO_CTRL 	 3
+#define PRIO_SORT 	 2
+#define PRIO_MONITOR 5
+#define PRIO_TIME 	 1
+#define STK 	 	 4096 	// tamanho de stack (bytes)
 
 // ===== Handles das tasks, filas e semáforos =====
-static TaskHandle_t hENC = NULL, hCTRL = NULL, hSORT = NULL, hSAFE = NULL, hREP = NULL;
+static TaskHandle_t hENC = NULL, hCTRL = NULL, hSORT = NULL, hSAFE = NULL, hMONITOR = NULL, hTIME = NULL;
 static TaskHandle_t hCtrlNotify = NULL;
 static QueueHandle_t qSort = NULL; 	 	// fila de eventos SORT_ACT
 static QueueHandle_t qSafety = NULL; 	// fila de eventos SAFETY
-static QueueHandle_t qHMI = NULL; // 	Fila para Latência HMI
-static SemaphoreHandle_t semEStop = NULL; // semáforo para E-stop
+static QueueHandle_t qHMI = NULL;       // Fila para Latência HMI
+//static SemaphoreHandle_t semEStop = NULL; // semáforo para E-stop
 static SemaphoreHandle_t mutexBeltState = NULL; // Protege g_belt e estop_ativo
 static SemaphoreHandle_t mutexStats = NULL; 	 	// Protege stats e cpu_time
 
 static volatile bool estop_ativo = false; // flag de E-stop ativo
+static int64_t max_sort_lat_us = 0;
+static int64_t max_safety_lat_us = 0;
 
 // ===== Estado da esteira =====
 typedef struct {
@@ -80,38 +80,39 @@ typedef struct {
 	int pad;
 } safety_evt_t;
 
-// ===== Estatísticas =====
+typedef struct {
+    uint32_t enc_samples, enc_misses;
+    uint32_t ctrl_runs, ctrl_misses;
+    uint32_t sort_events, sort_misses;
+    uint32_t safety_events, safety_misses;
+    int64_t sort_lat_total_us;
+    uint32_t sort_lat_count;
+    int64_t safety_lat_total_us; 
+    uint32_t safety_lat_count;
+    int64_t hmi_lat_total_us;
+    uint32_t hmi_lat_count;
+} report_stats_t; // TIPO NOMEADO
+
+typedef struct {
+    int64_t enc_time_us;
+    int64_t ctrl_time_us;
+    int64_t sort_time_us;
+    int64_t safety_time_us;
+    int64_t monitor_time_us;
+    int64_t time_task_us;
+} report_cpu_time_t; // TIPO NOMEADO
+
+// Métricas acumuladas (CORRIGIDO: Usa report_stats_t)
+static report_stats_t stats = {0};
+
+// Contadores de tempo ocupado da CPU (microsegundos) (CORRIGIDO: Usa report_cpu_time_t)
+static report_cpu_time_t cpu_time = {0}; 
+
 static struct {
-	uint32_t enc_samples, enc_misses;
-	uint32_t ctrl_runs, ctrl_misses;
-	uint32_t sort_events, sort_misses;
-	uint32_t safety_events, safety_misses;
-} last_stats = {0};
-
-// Métricas acumuladas
-static struct {
-	uint32_t enc_samples, enc_misses;
-	uint32_t ctrl_runs, ctrl_misses;
-	uint32_t sort_events, sort_misses;
-	uint32_t safety_events, safety_misses;
-
-	int64_t sort_lat_total_us; 	// soma latência SORT
-	uint32_t sort_lat_count; 	 	// qtd de eventos medidos
-
-	int64_t safety_lat_total_us; // soma latência Safety
-	uint32_t safety_lat_count;
-
-	int64_t hmi_lat_total_us; 	 	// soma latência HMI
-	uint32_t hmi_lat_count;
-} stats = {0};
-
-// Contadores de tempo ocupado da CPU (microsegundos)
-static struct {
-	int64_t enc_time_us;
-	int64_t ctrl_time_us;
-	int64_t sort_time_us;
-	int64_t safety_time_us;
-} cpu_time = {0};
+    report_stats_t stats; 
+    report_cpu_time_t cpu_time; 
+    int64_t last_time_us;
+} last_report_data = {0};
 
 void activate_estop(void);
 void set_belt_setpoint(float rpm);
@@ -148,6 +149,7 @@ void activate_estop(void) {
 	safety_evt_t ev = {.t_evt_us = esp_timer_get_time(), .pad = TP_ESTOP};
 	if (xQueueSend(qSafety, &ev, 0) == pdTRUE) {
         ESP_LOGI(TAG, "Comando E-STOP acionado (via cliente).");
+		gpio_set_level(LED_PIN, 1); // Liga o LED
     } else {
         ESP_LOGE(TAG, "Falha ao enviar evento de E-STOP para a fila!");
     }
@@ -157,30 +159,52 @@ void reset_estop(void) {
 	// A função set_belt_setpoint já protege o acesso a g_belt.set_rpm
 	set_belt_setpoint(120.f); 
 	ESP_LOGI(TAG, "Comando E-STOP resetado (via cliente).");
+	gpio_set_level(LED_PIN, 0); // Desliga o LED
     // A flag 'estop_ativo' é resetada pela task_spd_ctrl quando vê que o setpoint é > 0.
 }
 
 static void process_command(const char *command_rx, char *response_tx, size_t max_len) {
     float new_rpm = 0.0f;
-    
-    if (strstr(command_rx, "status")) {
+
+    // Remove espaços em branco do início/fim que podem vir da rede
+    char clean_command[256];
+    strncpy(clean_command, command_rx, sizeof(clean_command) - 1);
+    clean_command[sizeof(clean_command) - 1] = '\0'; // Garante terminação
+    // Remove trailing whitespace/newline
+    char *end = clean_command + strlen(clean_command) - 1;
+    while(end >= clean_command && (*end == '\n' || *end == '\r' || *end == ' ')) {
+        *end = '\0';
+        end--;
+    }
+
+    if (strcasecmp(clean_command, "status") == 0 || strcasecmp(clean_command, "temperatura?") == 0) { // Ignora case
         belt_state_t state;
         get_belt_state(&state);
-        snprintf(response_tx, max_len, 
-                 "{\"ok\":true,\"rpm\":%.1f,\"set_rpm\":%.1f,\"pos\":%.1f,\"estop_ativo\":%s}\n", 
-                 state.rpm, state.set_rpm, state.pos_mm, estop_ativo ? "true" : "false");         
-    } else if (strstr(command_rx, "estop_on")) {
+        snprintf(response_tx, max_len,
+                 "{\"ok\":true,\"rpm\":%.1f,\"set_rpm\":%.1f,\"pos\":%.1f,\"estop_ativo\":%s}\n",
+                 state.rpm, state.set_rpm, state.pos_mm, estop_ativo ? "true" : "false");
+    } else if (strcasecmp(clean_command, "estop_on") == 0) { // Ignora case
         activate_estop();
         snprintf(response_tx, max_len, "{\"ok\":true,\"cmd\":\"estop_on\"}\n");
-    } else if (strstr(command_rx, "estop_reset")) {
+    } else if (strcasecmp(clean_command, "estop_reset") == 0) { // Ignora case
         reset_estop();
         snprintf(response_tx, max_len, "{\"ok\":true,\"cmd\":\"estop_reset\"}\n");
-    } else if (sscanf(command_rx, "set_rpm %f", &new_rpm) == 1) {
+    } else if (sscanf(clean_command, "set_rpm %f", &new_rpm) == 1) {
          set_belt_setpoint(new_rpm);
          snprintf(response_tx, max_len, "{\"ok\":true,\"cmd\":\"set_rpm\",\"value\":%.1f}\n", new_rpm);
+    } else if (strcasecmp(clean_command, "sort_act_on") == 0) {
+        sort_evt_t ev = {.t_evt_us = esp_timer_get_time(), .pad = -1}; // Pad -1 indica ativação via rede
+        if (xQueueSend(qSort, &ev, 0) == pdTRUE) {
+             snprintf(response_tx, max_len, "{\"ok\":true,\"cmd\":\"sort_act_on\"}\n");
+        } else {
+             snprintf(response_tx, max_len, "{\"ok\":false,\"error\":\"Fila SORT_ACT cheia\"}\n");
+        }
+    } else if (strcasecmp(clean_command, "ping") == 0) {
+        int64_t now = esp_timer_get_time();
+        snprintf(response_tx, max_len,
+            "{\"ok\":true,\"cmd\":\"pong\",\"timestamp_us\":%lld}\n", now);
     } else {
-        // Comando desconhecido ou mal formatado
-        snprintf(response_tx, max_len, "{\"ok\":false,\"error\":\"Comando desconhecido ou mal formatado: %s\"}\n", command_rx);
+        snprintf(response_tx, max_len, "{\"ok\":false,\"error\":\"Comando desconhecido: '%s'\"}\n", clean_command);
     }
 }
 
@@ -191,6 +215,7 @@ static void wifi_init(void) {
 	esp_netif_create_default_wifi_sta();
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	wifi_config_t wifi_config = {
 		.sta = {
 			.threshold.authmode = WIFI_AUTH_WPA2_PSK,
@@ -210,145 +235,377 @@ static void time_sync_notification_cb(struct timeval *tv){
 	ESP_LOGI(TAG, "Tempo sincronizado via SNTP.");
 }
 
+// --- task_time (ATUALIZADA) --- [cite: 74, 117, 118]
 static void task_time(void *arg)
 {
-	time_t now = 0;
-	struct tm timeinfo = {0};
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    uint32_t cycles_since_sync = 0; // Contador de ciclos 
+    const uint32_t sync_warn_threshold = 30; // Avisa se ficar 30s sem sync
 
-	// Configuração do Fuso Horário
-	setenv("TZ", "GMT+3", 1);
-	tzset();
+    // Configuração do Fuso Horário
+    setenv("TZ", "GMT+3", 1);
+    tzset();
 
-	ESP_LOGI(TAG, "Iniciando SNTP...");
-	sntp_setoperatingmode(SNTP_OPMODE_POLL);
-	sntp_set_time_sync_notification_cb(time_sync_notification_cb);
-	sntp_setservername(0, "a.st1.ntp.br");
-	sntp_setservername(1, "b.st1.ntp.br");
-	sntp_setservername(2, "pool.ntp.org");
-	sntp_init();
+    ESP_LOGI(TAG, "Iniciando SNTP...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_set_sync_interval(20000); 
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_setservername(0, "time.google.com");
+    esp_sntp_setservername(1, "pool.ntp.br");
+    esp_sntp_setservername(2, "a.ntp.br");
+    esp_sntp_init();
 
-	int max_retries = 30;
-	for (int i = 0; i < max_retries && sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET; ++i) {
-		vTaskDelay(pdMS_TO_TICKS(500));
-	}
+    // Espera inicial pela sincronização (pode levar algum tempo)
+    ESP_LOGI(TAG, "Aguardando sincronizacao SNTP inicial...");
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
-	// Exibe a hora inicial após o sync
-	time(&now);
-	localtime_r(&now, &timeinfo);
-	char buf[64];
-	strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", &timeinfo);
-	ESP_LOGI(TAG, "Hora inicial: %s", buf);
-	
-	while (1) {
-		vTaskDelay(pdMS_TO_TICKS(10000));
-		
-		time(&now);
-		localtime_r(&now, &timeinfo);
-		char buf[64];
-		strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", &timeinfo);
-		ESP_LOGI(TAG, "Hora atual: %s", buf);
-	}
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG, "Hora inicial sincronizada: %s", buf);
+
+    TickType_t next_wake_time = xTaskGetTickCount();
+    const TickType_t period_ticks = pdMS_TO_TICKS(1000); // Período de 1 segundo 
+
+    while (1) {
+        // Medição de tempo de execução (C)
+        int64_t t_start = esp_timer_get_time();
+
+        cycles_since_sync++;
+
+		// Verifica se a sincronização foi completada
+        if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+             cycles_since_sync = 0; 
+        }
+
+		// Log da hora atual 
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", &timeinfo);
+
+		// Alerta se o tempo não for sincronizado após o limiar
+        if (cycles_since_sync > sync_warn_threshold) {
+             ESP_LOGE(TAG, "ALERTA: SNTP sem sincronizar por %u segundos! Status: %d. Hora: %s", 
+                      cycles_since_sync, sntp_get_sync_status(), buf);
+        } else {
+             ESP_LOGI(TAG, "Hora de Referencia: %s", buf);
+        }
+
+        // cpu_tight_loop_us(50);
+
+        int64_t t_end = esp_timer_get_time();
+        if (xSemaphoreTake(mutexStats, pdMS_TO_TICKS(10)) == pdTRUE) {
+            cpu_time.time_task_us += (t_end - t_start);
+            xSemaphoreGive(mutexStats);
+        }
+
+        vTaskDelayUntil(&next_wake_time, period_ticks);
+    }
 }
 
-static void udp_server_task(void *arg) {
-    // Cria o socket UDP (SOCK_DGRAM)
-	int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Falha ao criar socket UDP.");
-        vTaskDelete(NULL);
-    }
+// --- MONITOR_TASK (Refatorada: Servidor de Controle + Cliente de Relatório) ---
+static void monitor_task(void *arg)
+{
+    // =========================================================================
+    // 1. SELEÇÃO DE PROTOCOLO DE COMANDO (RECEBIMENTO)
+    // Descomente APENAS UMA das linhas abaixo para escolher o protocolo de controle
+    #define USE_UDP 
+    // #define USE_TCP 
+    // =========================================================================
 
-    // Configura e vincula a porta (Bind)
-	struct sockaddr_in addr = {0};
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(UDP_PORT);
-	addr.sin_addr.s_addr = htonl(INADDR_ANY); // Escuta em todas as interfaces
-
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        ESP_LOGE(TAG, "Falha ao fazer bind do socket UDP.");
-        close(sock);
-        vTaskDelete(NULL);
-    }
-	ESP_LOGI(TAG, "Servidor UDP ativo na porta %d", UDP_PORT);
-
-	char rx_buffer[256];
+    // --- 1. CONFIGURAÇÃO DO SOCKET DE CONTROLE (RECEBIMENTO DE COMANDOS) ---
+    int control_sock = -1;
+    int client_sock = -1; // Usado apenas no modo TCP
+	int report_sock = -1;
+    char rx_buffer[256];
     char tx_buffer[MAX_PAYLOAD_SIZE];
+    
+#if defined(USE_UDP)
+    // Configuração UDP (Servidor)
+    control_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (control_sock < 0) {
+        ESP_LOGE(TAG, "Falha ao criar socket UDP de Controle.");
+        goto cleanup_control;
+    }
 
-	while (1) {
+    struct sockaddr_in udp_addr = {0};
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_port = htons(UDP_PORT);
+    udp_addr.sin_addr.s_addr = htonl(INADDR_ANY); 
+
+    if (bind(control_sock, (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
+        ESP_LOGE(TAG, "Falha ao fazer bind do socket UDP.");
+        goto cleanup_control;
+    }
+    
+    // Configura o socket para ser não-bloqueante (retorna EAGAIN se não houver dados)
+    int flags = fcntl(control_sock, F_GETFL, 0);
+    if (fcntl(control_sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+        ESP_LOGE(TAG, "Falha ao configurar socket UDP como non-blocking");
+        goto cleanup_control;
+    }
+
+    ESP_LOGI(TAG, "Monitor Task (Controle) - Servidor UDP ativo na porta %d", UDP_PORT);
+
+#elif defined(USE_TCP)
+    // Configuração TCP (Servidor)
+    control_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (control_sock < 0) {
+        ESP_LOGE(TAG, "Falha ao criar socket TCP de Controle.");
+        goto cleanup_control;
+    }
+    
+    struct sockaddr_in tcp_addr = {0};
+    tcp_addr.sin_family = AF_INET;
+    tcp_addr.sin_port = htons(TCP_PORT);
+    tcp_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    
+    if (bind(control_sock, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) < 0) {
+        ESP_LOGE(TAG, "Falha ao fazer bind do socket TCP.");
+        goto cleanup_control;
+    }
+    
+    listen(control_sock, 1);
+    
+    // Configura o socket LISTEN para ser não-bloqueante no accept
+    int flags_listen = fcntl(control_sock, F_GETFL, 0);
+    if (fcntl(control_sock, F_SETFL, flags_listen | O_NONBLOCK) == -1) {
+        ESP_LOGE(TAG, "Falha ao configurar socket TCP listen como non-blocking");
+        goto cleanup_control;
+    }
+    
+    ESP_LOGI(TAG, "Monitor Task (Controle) - Servidor TCP ativo na porta %d", TCP_PORT);
+#else
+    ESP_LOGE(TAG, "ERRO: Nenhum protocolo de rede selecionado (USE_UDP ou USE_TCP).");
+    vTaskDelete(NULL);
+#endif
+
+    // --- 2. CONFIGURAÇÃO DO SOCKET DE RELATÓRIO (ENVIO DE LOGS - SEMPRE UDP) ---
+    report_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (report_sock < 0) {
+        ESP_LOGE(TAG, "Falha ao criar socket UDP para Relatório.");
+        goto cleanup_control;
+    }
+
+    struct sockaddr_in dest_addr = {0};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(REPORT_PORT); 
+    inet_pton(AF_INET, PC_IP, &dest_addr.sin_addr.s_addr);
+
+    ESP_LOGI(TAG, "Monitor Task - Enviando status UDP para %s:%d a cada 500ms.", PC_IP, REPORT_PORT);
+
+    TickType_t next_wake_time = xTaskGetTickCount();
+    const TickType_t period_ticks = pdMS_TO_TICKS(500); // Período de 500ms (D)
+	int report_cycle_counter = 0;
+    const int REPORT_PERIOD_CYCLES = 120; // 120 ciclos * 500ms = 60 segundos
+
+	// Inicializa a variável de controle na primeira execução
+    if (last_report_data.last_time_us == 0) {
+        if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
+            last_report_data.stats = stats;
+            last_report_data.cpu_time = cpu_time;
+            xSemaphoreGive(mutexStats);
+        }
+        last_report_data.last_time_us = esp_timer_get_time();
+    }
+
+    while(1) {
+        // Medição de tempo de execução (C)
+        int64_t t_start = esp_timer_get_time();
+        
+        // -------------------------------------------------------------------
+        // B. RECEBIMENTO DE COMANDO (CONTROLE - SERVIDOR)
+        // -------------------------------------------------------------------
+#if defined(USE_UDP)
+        // Lógica de recebimento UDP não-bloqueante
         struct sockaddr_in source_addr;
         socklen_t addr_len = sizeof(source_addr);
         
-        // Recebe o pacote UDP e armazena o endereço de origem
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &addr_len);
+        // Tenta receber um pacote sem bloquear o ciclo de 500ms
+        int len = recvfrom(control_sock, rx_buffer, sizeof(rx_buffer) - 1, MSG_DONTWAIT, (struct sockaddr *)&source_addr, &addr_len);
         
-        if (len < 0) {
-             ESP_LOGE(TAG, "Erro em recvfrom: %d", errno);
-             continue;
-        } else if (len > 0) {
-            // Tratamento de string
-            rx_buffer[len] = 0;
-
-            char *end = rx_buffer + len - 1;
-            while (end >= rx_buffer && (*end == '\n' || *end == '\r' || *end == ' ')) {
-                *end = '\0';
-                end--;
-            }
+        if (len > 0) {
+            rx_buffer[len] = 0; // Termina a string
+            ESP_LOGI(TAG, "UDP RX de %s:%d: %s", inet_ntoa(source_addr.sin_addr), ntohs(source_addr.sin_port), rx_buffer);
             
-            ESP_LOGI(TAG, "UDP RX de %s:%d: %s", 
-                     inet_ntoa(source_addr.sin_addr), 
-                     ntohs(source_addr.sin_port), 
-                     rx_buffer);
-
-            // 4. Processa o comando
-            // Nota: Garanta que sua função process_command lida com:
-            // "ping" -> Resposta JSON de pong
-            // "temperatura?" ou "status" -> Resposta JSON de status
-            // "ESTOP_ON" -> Aciona o estop
+            // Processa comando e gera resposta
             process_command(rx_buffer, tx_buffer, sizeof(tx_buffer));
             
-            // Envia a resposta de volta para o endereço de origem (PC)
-            sendto(sock, tx_buffer, strlen(tx_buffer), 0, (struct sockaddr *)&source_addr, addr_len);
+            // Envia a resposta de volta para o cliente UDP
+            sendto(control_sock, tx_buffer, strlen(tx_buffer), 0, (struct sockaddr *)&source_addr, addr_len);
+
+        } else if (len < 0 && errno != EWOULDBLOCK) {
+            ESP_LOGE(TAG, "Erro em recvfrom UDP: %d", errno);
         }
-	}
-    ESP_LOGI(TAG, "Fechando socket UDP...");
-    close(sock);
+
+#elif defined(USE_TCP)
+        // Lógica de recebimento TCP não-bloqueante e reativa
+        
+        if (client_sock < 0) {
+            // Tenta aceitar uma nova conexão (non-blocking)
+            struct sockaddr_in6 source_addr; socklen_t addr_len = sizeof(source_addr);
+            client_sock = accept(control_sock, (struct sockaddr *)&source_addr, &addr_len);
+            
+            if (client_sock >= 0) {
+                ESP_LOGI(TAG, "Cliente TCP conectado.");
+                // Configura o socket do cliente para ser não-bloqueante (para não travar o loop de 500ms)
+                int flags_client = fcntl(client_sock, F_GETFL, 0);
+                fcntl(client_sock, F_SETFL, flags_client | O_NONBLOCK);
+
+                const char *hello = "ESP32: conectado! Digite 'status', 'estop_on', 'estop_reset' ou 'set_rpm 150.0'\n";
+                send(client_sock, hello, strlen(hello), 0);
+            } else if (errno != EWOULDBLOCK) {
+                ESP_LOGE(TAG, "Erro em accept TCP: %d", errno);
+            }
+        }
+        
+        if (client_sock >= 0) {
+            // Tenta receber dados do cliente conectado (non-blocking)
+            int len = recv(client_sock, rx_buffer, sizeof(rx_buffer) - 1, MSG_DONTWAIT);
+            
+            if (len > 0) {
+                rx_buffer[len] = 0;
+                ESP_LOGI(TAG, "TCP RX: %s", rx_buffer);
+                
+                // Processa comando e gera resposta
+                process_command(rx_buffer, tx_buffer, sizeof(tx_buffer));
+                send(client_sock, tx_buffer, strlen(tx_buffer), 0);
+            
+            } else if (len == 0 || (len < 0 && errno != EWOULDBLOCK)) {
+                // Cliente desconectou (len == 0) ou erro real
+                ESP_LOGI(TAG, "Cliente TCP saiu/erro: %d", errno);
+                shutdown(client_sock, 0);
+                close(client_sock);
+                client_sock = -1; // Pronto para aceitar um novo cliente
+            }
+        }
+#endif
+
+		report_cycle_counter++;
+
+		if (report_cycle_counter >= REPORT_PERIOD_CYCLES) {
+            report_cycle_counter = 0;
+            
+            // Variáveis de coleta de dados no período
+            uint32_t enc_samples_delta, enc_misses_delta, ctrl_runs_delta, ctrl_misses_delta;
+            uint32_t sort_events_delta, sort_misses_delta, safety_events_delta, safety_misses_delta;
+            int64_t sort_lat_total_delta, safety_lat_total_delta, hmi_lat_total_delta;
+            uint32_t sort_lat_count_delta, safety_lat_count_delta, hmi_lat_count_delta;
+            int64_t cpu_time_total_delta = 0;
+            int64_t total_period_us;
+            
+            belt_state_t current_belt;
+            get_belt_state(&current_belt);
+            
+            int64_t t_now = esp_timer_get_time();
+
+            if (xSemaphoreTake(mutexStats, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // Cálculo de Deltas
+                enc_samples_delta = stats.enc_samples - last_report_data.stats.enc_samples;
+                enc_misses_delta = stats.enc_misses - last_report_data.stats.enc_misses;
+                ctrl_runs_delta = stats.ctrl_runs - last_report_data.stats.ctrl_runs;
+                ctrl_misses_delta = stats.ctrl_misses - last_report_data.stats.ctrl_misses;
+                sort_events_delta = stats.sort_events - last_report_data.stats.sort_events;
+                sort_misses_delta = stats.sort_misses - last_report_data.stats.sort_misses;
+                safety_events_delta = stats.safety_events - last_report_data.stats.safety_events;
+                safety_misses_delta = stats.safety_misses - last_report_data.stats.safety_misses;
+
+                sort_lat_total_delta = stats.sort_lat_total_us - last_report_data.stats.sort_lat_total_us;
+                sort_lat_count_delta = stats.sort_lat_count - last_report_data.stats.sort_lat_count;
+                safety_lat_total_delta = stats.safety_lat_total_us - last_report_data.stats.safety_lat_total_us;
+                safety_lat_count_delta = stats.safety_lat_count - last_report_data.stats.safety_lat_count;
+                hmi_lat_total_delta = stats.hmi_lat_total_us - last_report_data.stats.hmi_lat_total_us;
+                hmi_lat_count_delta = stats.hmi_lat_count - last_report_data.stats.hmi_lat_count;
+
+                // Cálculo de Tempo de CPU Total
+                cpu_time_total_delta += cpu_time.enc_time_us - last_report_data.cpu_time.enc_time_us;
+                cpu_time_total_delta += cpu_time.ctrl_time_us - last_report_data.cpu_time.ctrl_time_us;
+                cpu_time_total_delta += cpu_time.sort_time_us - last_report_data.cpu_time.sort_time_us;
+                cpu_time_total_delta += cpu_time.safety_time_us - last_report_data.cpu_time.safety_time_us;
+                cpu_time_total_delta += cpu_time.monitor_time_us - last_report_data.cpu_time.monitor_time_us;
+                cpu_time_total_delta += cpu_time.time_task_us - last_report_data.cpu_time.time_task_us;
+
+                // ATUALIZAÇÃO para o próximo ciclo
+                last_report_data.stats = stats;
+                last_report_data.cpu_time = cpu_time;
+                xSemaphoreGive(mutexStats);
+            } else {
+                ESP_LOGE(TAG, "Falha ao obter mutexStats para Relatório!");
+                goto end_report_cycle; // Pula este ciclo de relatório se falhar o mutex
+            }
+
+            // Cálculo do tempo total do período
+            total_period_us = t_now - last_report_data.last_time_us;
+            last_report_data.last_time_us = t_now;
+
+            // CÁLCULO DE MÉDIAS E PERCENTUAIS
+            int64_t avg_sort_lat = sort_lat_count_delta > 0 ? sort_lat_total_delta / sort_lat_count_delta : 0;
+            int64_t avg_safety_lat = safety_lat_count_delta > 0 ? safety_lat_total_delta / safety_lat_count_delta : 0;
+            int64_t avg_hmi_lat = hmi_lat_count_delta > 0 ? hmi_lat_total_delta / hmi_lat_count_delta : 0;
+
+            float cpu_usage = (float)cpu_time_total_delta * 100.0f / (float)total_period_us;
+            
+            float enc_miss_pct = enc_samples_delta > 0 ? (float)enc_misses_delta * 100.0f / (float)enc_samples_delta : 0.0f;
+            float ctrl_miss_pct = ctrl_runs_delta > 0 ? (float)ctrl_misses_delta * 100.0f / (float)ctrl_runs_delta : 0.0f;
+            float sort_miss_pct = sort_events_delta > 0 ? (float)sort_misses_delta * 100.0f / (float)sort_events_delta : 0.0f;
+            float safety_miss_pct = safety_events_delta > 0 ? (float)safety_misses_delta * 100.0f / (float)safety_events_delta : 0.0f;
+
+            // FORMATA O JSON COMPLETO
+                snprintf(tx_buffer, sizeof(tx_buffer),
+                "=== REPORT (%lld us) ===\n"
+                "ENC_SENSE: samples=%lu misses=%lu\n"
+                "SPD_CTRL : runs=%lu misses=%lu\n"
+                "HMI latency (avg) = %lld us\n"
+                "SORT_ACT : events=%lu misses=%lu\n"
+                "SORT_ACT latency (avg) = %lld us | max = %lld us\n"
+                "SAFETY   : events=%lu misses=%lu\n"
+                "SAFETY latency (avg) = %lld us | max = %lld us\n"
+                "Belt state: rpm=%.1f set=%.1f pos=%.1fmm\n"
+                "CPU usage (aprox) = %.1f%%\n"
+                "Miss pct: ENC=%.2f%% CTRL=%.2f%% SORT=%.2f%% SAFETY=%.2f%%\n"
+                "============================\n",
+                (long long)t_now,
+                enc_samples_delta, enc_misses_delta,
+                ctrl_runs_delta, ctrl_misses_delta,
+                (long long)avg_hmi_lat,
+                sort_events_delta, sort_misses_delta, (long long)avg_sort_lat, (long long)max_sort_lat_us,
+                safety_events_delta, safety_misses_delta, (long long)avg_safety_lat, (long long)max_safety_lat_us,
+                current_belt.rpm, current_belt.set_rpm, current_belt.pos_mm,
+                cpu_usage, enc_miss_pct, ctrl_miss_pct, sort_miss_pct, safety_miss_pct
+            );
+
+            // ENVIAR O RELATÓRIO UDP
+            sendto(report_sock, tx_buffer, strlen(tx_buffer), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            ESP_LOGI(TAG, "Relatorio Estatistico Enviado.");
+
+            max_sort_lat_us = 0;
+            max_safety_lat_us = 0;
+        }
+
+		end_report_cycle:;
+
+        int64_t t_end = esp_timer_get_time();
+        // Atualiza tempo de CPU (protegido por mutex)
+        if (xSemaphoreTake(mutexStats, pdMS_TO_TICKS(10)) == pdTRUE) {
+            cpu_time.monitor_time_us += (t_end - t_start);
+            xSemaphoreGive(mutexStats);
+        }
+
+        // Aguarda próximo ciclo periodicamente 
+        vTaskDelayUntil(&next_wake_time, period_ticks);
+    }
+
+cleanup_control:
+    // Garante que ambos os sockets sejam fechados, se criados
+    if (control_sock >= 0) close(control_sock);
+    if (report_sock >= 0) close(report_sock);
+    if (client_sock >= 0) close(client_sock);
+
     vTaskDelete(NULL);
-}
-
-//Espera pacotes enviados pelo PC usando Protocolo TCP e devolve informações
-static void tcp_server_task(void *arg) {
-	int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-	struct sockaddr_in addr = {0};
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(TCP_PORT);
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
-	listen(listen_fd, 1);
-	ESP_LOGI(TAG, "Servidor TCP na porta %d", TCP_PORT);
-
-	while (1) {
-		struct sockaddr_in6 source_addr; socklen_t addr_len = sizeof(source_addr);
-		int sock = accept(listen_fd, (struct sockaddr *)&source_addr, &addr_len);
-		if (sock < 0) continue;
-		ESP_LOGI(TAG, "Cliente conectado");
-
-		const char *hello = "ESP32: conectado! Digite 'status', 'estop_on', 'estop_reset' ou 'set_rpm 150.0'\n";
-		send(sock, hello, strlen(hello), 0);
-
-		char rx[256];
-		while (1) {
-			int len = recv(sock, rx, sizeof(rx)-1, 0);
-			if (len <= 0) { ESP_LOGI(TAG, "Cliente saiu"); break; }
-			rx[len] = 0;
-			ESP_LOGI(TAG, "RX: %s", rx);
-
-			char tx[MAX_PAYLOAD_SIZE];
-			process_command(rx, tx, sizeof(tx));
-			send(sock, tx, strlen(tx), 0);
-		}
-		shutdown(sock, 0);
-		close(sock);
-	}
 }
 
 // ===== Task: Encoders =====
@@ -484,6 +741,9 @@ static void task_sort_act(void *arg)
 				int64_t latency_us = t_start - ev.t_evt_us;
 				stats.sort_lat_total_us += latency_us;
 				stats.sort_lat_count++;
+                if (latency_us > max_sort_lat_us) {
+                    max_sort_lat_us = latency_us;
+                }
 
 				int64_t t1 = esp_timer_get_time();
 				cpu_tight_loop_us(500); // simula carga
@@ -513,6 +773,9 @@ static void task_safety(void *arg)
 				int64_t latency_us = t_start - ev.t_evt_us;
 				stats.safety_lat_total_us += latency_us;
 				stats.safety_lat_count++;
+                if (latency_us > max_safety_lat_us) {
+                    max_safety_lat_us = latency_us;
+                }
 
 				int64_t t1 = esp_timer_get_time();
 				cpu_tight_loop_us(800);
@@ -534,127 +797,6 @@ static void task_safety(void *arg)
 				xSemaphoreGive(mutexBeltState);
 			}
 		}
-	}
-}
-
-// ===== Task: REPORT =====
-static void task_report(void *arg)
-{
-	TickType_t next = xTaskGetTickCount();
-	const float REPORT_PERIOD_MS = 60000;
-	const float REPORT_PERIOD_US = REPORT_PERIOD_MS * 1000.0f;
-	const TickType_t T = pdMS_TO_TICKS(REPORT_PERIOD_MS); // 60 segundos
-
-	for (;;) {
-		vTaskDelayUntil(&next, T);
-
-		int64_t t_now = esp_timer_get_time();
-		
-		// Variáveis de escopo local para os resultados do ciclo
-        uint32_t enc_samples_now = 0, enc_misses_now = 0, ctrl_runs_now = 0, ctrl_misses_now = 0;
-        uint32_t sort_events_now = 0, sort_misses_now = 0, safety_events_now = 0, safety_misses_now = 0;
-        float enc_miss_pct = 0.0f, ctrl_miss_pct = 0.0f, sort_miss_pct = 0.0f, safety_miss_pct = 0.0f;
-        int64_t avg_sort_lat = 0LL, avg_safety_lat = 0LL, avg_hmi_lat = 0LL;
-        int64_t total_cpu_time = 0LL;
-        float cpu_usage = 0.0f;
-
-		if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
-	
-			// 1. TRATAMENTO ATÔMICO do contador concorrente com a ISR
-			uint32_t current_sort_misses;
-			
-			// variável de estado do Mutex/Seção Crítica
-			portMUX_TYPE my_spinlock = portMUX_INITIALIZER_UNLOCKED;
-
-			// Protege o acesso a stats.sort_misses da ISR
-			portENTER_CRITICAL(&my_spinlock); 
-			current_sort_misses = stats.sort_misses;
-			portEXIT_CRITICAL(&my_spinlock);
-
-			// Cálculo da diferença e atualização de last_stats (COM O VALOR PROTEGIDO)
-			sort_misses_now = current_sort_misses - last_stats.sort_misses;
-			last_stats.sort_misses = current_sort_misses;
-			// FIM DO TRATAMENTO ATÔMICO
-
-			// Calcula diferenças dos demais campos (protegidos pelo mutexStats)
-			enc_samples_now = stats.enc_samples - last_stats.enc_samples;
-			enc_misses_now 	= stats.enc_misses - last_stats.enc_misses;
-			ctrl_runs_now 	= stats.ctrl_runs - last_stats.ctrl_runs;
-			ctrl_misses_now = stats.ctrl_misses - last_stats.ctrl_misses;
-			sort_events_now = stats.sort_events - last_stats.sort_events;
-			// sort_misses_now já foi calculado
-			safety_events_now = stats.safety_events - last_stats.safety_events;
-			safety_misses_now = stats.safety_misses - last_stats.safety_misses;
-
-			// Atualiza last_stats (APENAS os campos protegidos pelo mutex)
-			last_stats.enc_samples = stats.enc_samples;
-			last_stats.enc_misses 	= stats.enc_misses;
-			last_stats.ctrl_runs 	= stats.ctrl_runs;
-			last_stats.ctrl_misses = stats.ctrl_misses;
-			last_stats.sort_events = stats.sort_events;
-			// last_stats.sort_misses já foi atualizado acima de forma protegida
-			last_stats.safety_events = stats.safety_events;
-			last_stats.safety_misses = stats.safety_misses;
-
-			// Cálculo de porcentagem de misses
-			enc_miss_pct 	= 100.0f * enc_misses_now 	/ (enc_samples_now + enc_misses_now);
-			ctrl_miss_pct = 100.0f * ctrl_misses_now / (ctrl_runs_now + ctrl_misses_now);
-
-			sort_miss_pct = 0.0f;
-			if ((sort_events_now + sort_misses_now) != 0)
-				sort_miss_pct = 100.0f * sort_misses_now / (sort_events_now + sort_misses_now);
-
-			safety_miss_pct = 0.0f;
-			if ((safety_events_now + safety_misses_now) != 0)
-				safety_miss_pct = 100.0f * safety_misses_now / (safety_events_now + safety_misses_now);
-
-			avg_sort_lat = stats.sort_lat_count ? stats.sort_lat_total_us / stats.sort_lat_count : 0;
-			avg_safety_lat = stats.safety_lat_count ? stats.safety_lat_total_us / stats.safety_lat_count : 0;
-			avg_hmi_lat = stats.hmi_lat_count ? stats.hmi_lat_total_us / stats.hmi_lat_count : 0;
-
-			// Uso aproximado da CPU
-			total_cpu_time = cpu_time.enc_time_us + 
-							cpu_time.ctrl_time_us + 
-							cpu_time.sort_time_us + 
-							cpu_time.safety_time_us;
-
-			cpu_usage = (float)total_cpu_time * 100.0f / REPORT_PERIOD_US;
-
-			// Reset tempos
-			cpu_time.enc_time_us = cpu_time.ctrl_time_us = cpu_time.sort_time_us = cpu_time.safety_time_us = 0;
-
-			// Reset dos latências
-			stats.sort_lat_total_us = 0;
-			stats.sort_lat_count = 0;
-			stats.safety_lat_total_us = 0;
-			stats.safety_lat_count = 0;
-			stats.hmi_lat_total_us = 0;
-			stats.hmi_lat_count = 0;
-
-			xSemaphoreGive(mutexStats);
-		}
-
-		belt_state_t current_state;
-		get_belt_state(&current_state);
-		float belt_rpm = current_state.rpm;
-		float belt_set_rpm = current_state.set_rpm;
-		float belt_pos_mm = current_state.pos_mm;
-		
-		// Impressão do relatório
-		ESP_LOGI(TAG, "=== REPORT (%lld us) ===", (long long)t_now);
-		ESP_LOGI(TAG, "ENC_SENSE: samples=%u misses=%u", enc_samples_now, enc_misses_now);
-		ESP_LOGI(TAG, "SPD_CTRL : runs=%u misses=%u", ctrl_runs_now, ctrl_misses_now);
-		ESP_LOGI(TAG, "HMI latency (avg) = %lld us", (long long)avg_hmi_lat);
-		ESP_LOGI(TAG, "SORT_ACT : events=%u misses=%u", sort_events_now, sort_misses_now);
-		ESP_LOGI(TAG, "SORT_ACT latency (avg) = %lld us", (long long)avg_sort_lat);
-		ESP_LOGI(TAG, "SAFETY : events=%u misses=%u", safety_events_now, safety_misses_now);
-		ESP_LOGI(TAG, "SAFETY latency (avg) = %lld us", (long long)avg_safety_lat);
-			ESP_LOGI(TAG, "Belt state: rpm=%.1f set=%.1f pos=%.1fmm",
-				belt_rpm, belt_set_rpm, belt_pos_mm);
-		ESP_LOGI(TAG, "CPU usage (aprox) = %.1f%%", cpu_usage);
-		ESP_LOGI(TAG, "Miss pct: ENC=%.2f%% CTRL=%.2f%% SORT=%.2f%% SAFETY=%.2f%%",
-			enc_miss_pct, ctrl_miss_pct, sort_miss_pct, safety_miss_pct);
-		ESP_LOGI(TAG, "============================");
 	}
 }
 
@@ -726,18 +868,21 @@ void app_main(void)
 	qSort = xQueueCreate(100, sizeof(sort_evt_t));
 	qSafety = xQueueCreate(10, sizeof(safety_evt_t));
 	qHMI = xQueueCreate(1, sizeof(int64_t));
-	semEStop = xSemaphoreCreateBinary();
+	//semEStop = xSemaphoreCreateBinary();
 	mutexBeltState = xSemaphoreCreateMutex();
 	mutexStats = xSemaphoreCreateMutex();
 
-	if (!semEStop || !qHMI || !qSort || !qSafety || !mutexBeltState || !mutexStats) {
+	if (!qHMI || !qSort || !qSafety || !mutexBeltState || !mutexStats) {
 		ESP_LOGE(TAG, "Falha ao criar semáforos/filas/mutexes");
 		return;
 	}
 
+	gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0); // LED começa desligado
+
 	ESP_ERROR_CHECK(nvs_flash_init());
 	wifi_init();
-
 	init_touch_pads();
 
 	// Criação de tasks
@@ -746,10 +891,8 @@ void app_main(void)
 	xTaskCreatePinnedToCore(task_spd_ctrl, "SPD_CTRL", STK, NULL, PRIO_CTRL, &hCTRL, 1);
 	hCtrlNotify = hCTRL; // handle para notificações
 	xTaskCreatePinnedToCore(task_sort_act, "SORT_ACT", STK, NULL, PRIO_SORT, &hSORT, 1);
-	xTaskCreatePinnedToCore(task_report, "REPORT", STK, NULL, PRIO_REP, &hREP, 1);
-	xTaskCreatePinnedToCore(task_time, "TIME_TASK", STK, NULL, PRIO_TIME, NULL, 0);
-	xTaskCreatePinnedToCore(tcp_server_task, "TCP_SERVER", STK, NULL, PRIO_TCP, NULL, 0);
-	//xTaskCreatePinnedToCore(udp_server_task, "UDP_TASK", STK, NULL, PRIO_UDP, NULL, 0);
+	xTaskCreatePinnedToCore(task_time, "TIME_TASK", STK, NULL, PRIO_TIME, &hTIME, 0);
+	xTaskCreatePinnedToCore(monitor_task, "MONITOR", STK, NULL, PRIO_MONITOR, &hMONITOR, 0);
 
 	ESP_LOGI(TAG, "Tasks criadas e esteira inicializada com Touch pads");
 }
