@@ -23,13 +23,18 @@
 #define TAG "ESTEIRA"
 
 // ===== Configuração de rede =====
-#define WIFI_SSID "Nome do wifi"
-#define WIFI_PASS "Senha do wifi"
+#define WIFI_SSID "AndroidAPEE80"
+#define WIFI_PASS "qlma2773"
 #define TCP_PORT 10420 // qualquer número entre 0 e 65535
-#define PC_IP 	"IP do ipconfig"
+#define PC_IP 	"10.15.0.146"
 #define UDP_PORT 10421 // qualquer número entre 0 e 65535
 #define REPORT_PORT 10421 // Porta onde o PC Servidor de Logs (Monitor Task) estará escutando
 #define MAX_PAYLOAD_SIZE 1024 // Define um tamanho máximo para a mensagem de rede
+
+// ---------- Novas estruturas para logging / WCRT / (m,k)-firm ----------
+#define EVENT_LOG_SIZE 256   // quantos eventos guardar para análise posterior
+#define MK_K 10              // k para (m,k)-firm
+#define MK_M 9               // exemplo (9,10)-firm (ajuste conforme necessário)
 
 #define TP_OBJ 	TOUCH_PAD_NUM0 	// GPIO4
 #define TP_HMI 	TOUCH_PAD_NUM3 	// GPIO15
@@ -59,6 +64,7 @@ static SemaphoreHandle_t mutexStats = NULL; 	 	// Protege stats e cpu_time
 static volatile bool estop_ativo = false; // flag de E-stop ativo
 static int64_t max_sort_lat_us = 0;
 static int64_t max_safety_lat_us = 0;
+static uint32_t cycles_since_sync_global = 0;
 
 // ===== Estado da esteira =====
 typedef struct {
@@ -101,6 +107,38 @@ typedef struct {
     int64_t monitor_time_us;
     int64_t time_task_us;
 } report_cpu_time_t; // TIPO NOMEADO
+
+typedef struct {
+    int64_t seq;
+    int64_t timestamp_evt_us;      // quando evento ocorreu (ISR)
+    int64_t timestamp_task_start;  // quando a task começou a processar
+    int64_t timestamp_task_end;    // quando terminou
+    int pad;
+} event_log_entry_t;
+
+typedef struct {
+    uint8_t window[MK_K];
+    int idx;
+    int count_true; // quantas deadlines cumpridas na janela atual
+} mk_firm_t;
+
+static mk_firm_t mk_sort = { {0}, 0, 0 };
+static mk_firm_t mk_safety = { {0}, 0, 0 };
+
+static event_log_entry_t event_log[EVENT_LOG_SIZE];
+static size_t event_log_head = 0;
+
+#define LAT_BUFFER_SIZE 1024
+static int64_t sort_lat_buf[LAT_BUFFER_SIZE];
+static size_t sort_lat_buf_idx = 0;
+static int64_t sort_max_lat = 0;
+
+static int64_t safety_lat_buf[LAT_BUFFER_SIZE];
+static size_t safety_lat_buf_idx = 0;
+static int64_t safety_max_lat = 0;
+
+// Sequence number for reports
+static int64_t monitor_seq = 0;
 
 // Métricas acumuladas (CORRIGIDO: Usa report_stats_t)
 static report_stats_t stats = {0};
@@ -276,6 +314,10 @@ static void task_time(void *arg)
         int64_t t_start = esp_timer_get_time();
 
         cycles_since_sync++;
+        if (xSemaphoreTake(mutexStats, pdMS_TO_TICKS(10)) == pdTRUE) {
+            cycles_since_sync_global = cycles_since_sync;
+            xSemaphoreGive(mutexStats);
+        }
 
 		// Verifica se a sincronização foi completada
         if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
@@ -401,7 +443,7 @@ static void monitor_task(void *arg)
     TickType_t next_wake_time = xTaskGetTickCount();
     const TickType_t period_ticks = pdMS_TO_TICKS(500); // Período de 500ms (D)
 	int report_cycle_counter = 0;
-    const int REPORT_PERIOD_CYCLES = 120; // 120 ciclos * 500ms = 60 segundos
+    const int REPORT_PERIOD_CYCLES = 60; // 120 ciclos * 500ms = 60 segundos
 
 	// Inicializa a variável de controle na primeira execução
     if (last_report_data.last_time_us == 0) {
@@ -578,9 +620,57 @@ static void monitor_task(void *arg)
                 cpu_usage, enc_miss_pct, ctrl_miss_pct, sort_miss_pct, safety_miss_pct
             );
 
+            monitor_seq++;
+
+            time_t sntp_sec;
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            sntp_sec = tv.tv_sec;
+            int64_t sntp_us = (int64_t)tv.tv_sec * 1000000LL + (int64_t)tv.tv_usec;
+            int pkt_size = 0;
+
+            pkt_size = snprintf(tx_buffer, sizeof(tx_buffer),
+                "{\n"
+                "  \"type\":\"monitor_report\",\n"
+                "  \"seq\":%lld,\n"
+                "  \"protocol\":\"UDP\",\n"
+                "  \"pkt_size\":%d,\n"
+                "  \"sntp_time_s\":%lld,\n"
+                "  \"sntp_time_us\":%lld,\n"
+                "  \"esp_time_us\":%lld,\n"
+                "  \"period_us\":%lld,\n"
+                "  \"enc\": { \"samples\": %lu, \"misses\": %lu },\n"
+                "  \"ctrl\": { \"runs\": %lu, \"misses\": %lu },\n"
+                "  \"sort\": { \"events\": %lu, \"misses\": %lu, \"avg_lat_us\": %lld, \"max_lat_us\": %lld },\n"
+                "  \"safety\": { \"events\": %lu, \"misses\": %lu, \"avg_lat_us\": %lld, \"max_lat_us\": %lld },\n"
+                "  \"belt\": { \"rpm\": %.1f, \"set_rpm\": %.1f, \"pos_mm\": %.1f },\n"
+                "  \"cpu_usage_pct\": %.2f,\n"
+                "  \"mk_sort\": { \"m\": %d, \"k\": %d, \"met_in_window\": %d },\n"
+                "  \"mk_safety\": { \"m\": %d, \"k\": %d, \"met_in_window\": %d }\n"
+                "}\n",
+                (long long)monitor_seq,
+                0, // placeholder pkt_size (atualizamos depois)
+                (long long)tv.tv_sec,
+                (long long)tv.tv_usec,
+                (long long)t_now,
+                (long long)total_period_us,
+                enc_samples_delta, enc_misses_delta,
+                ctrl_runs_delta, ctrl_misses_delta,
+                sort_events_delta, sort_misses_delta, (long long)avg_sort_lat, (long long)sort_max_lat,
+                safety_events_delta, safety_misses_delta, (long long)avg_safety_lat, (long long)safety_max_lat,
+                current_belt.rpm, current_belt.set_rpm, current_belt.pos_mm,
+                cpu_usage,
+                MK_M, MK_K, mk_sort.count_true,
+                MK_M, MK_K, mk_safety.count_true
+            );
+
+            int real_pkt_size = strlen(tx_buffer);
+            char pkt_size_str[32];
+            snprintf(pkt_size_str, sizeof(pkt_size_str), "\"pkt_size\":%d,", real_pkt_size);
+
             // ENVIAR O RELATÓRIO UDP
-            sendto(report_sock, tx_buffer, strlen(tx_buffer), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-            ESP_LOGI(TAG, "Relatorio Estatistico Enviado.");
+            sendto(report_sock, tx_buffer, real_pkt_size, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            ESP_LOGI(TAG, "Relatorio Estatistico Enviado (seq=%lld size=%d).", (long long)monitor_seq, real_pkt_size);
 
             max_sort_lat_us = 0;
             max_safety_lat_us = 0;
@@ -727,77 +817,143 @@ static void task_spd_ctrl(void *arg)
 	}
 }
 
-// ===== Task: SORT_ACT =====
+// ===== Task: SORT_ACT (modificado para log/timestamps/WCRT/(m,k)-firm) =====
 static void task_sort_act(void *arg)
 {
-	sort_evt_t ev;
-	for (;;) {
-		if (xQueueReceive(qSort, &ev, portMAX_DELAY) == pdTRUE) {
-			if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
-				stats.sort_events++;
-				int64_t t_start = esp_timer_get_time();
+    sort_evt_t ev;
+    for (;;) {
+        if (xQueueReceive(qSort, &ev, portMAX_DELAY) == pdTRUE) {
+            int64_t t_task_start = esp_timer_get_time();
 
-				// Latência ISR -> task
-				int64_t latency_us = t_start - ev.t_evt_us;
-				stats.sort_lat_total_us += latency_us;
-				stats.sort_lat_count++;
-                if (latency_us > max_sort_lat_us) {
-                    max_sort_lat_us = latency_us;
-                }
+            // Atualiza stats
+            if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
+                stats.sort_events++;
+                xSemaphoreGive(mutexStats);
+            }
 
-				int64_t t1 = esp_timer_get_time();
-				cpu_tight_loop_us(500); // simula carga
-				int64_t t2 = esp_timer_get_time();
-				cpu_time.sort_time_us += (t2 - t1);
+            // calcular latência ISR->task
+            int64_t latency_us = t_task_start - ev.t_evt_us;
 
-				printf("SORT_ACT: evento touch pad %d @ %lld -> started @ %lld (lat=%lld us)\n",
-					ev.pad, (long long)ev.t_evt_us, (long long)t_start, (long long)latency_us);
-				
-				xSemaphoreGive(mutexStats);
-			}
-		}
-	}
+            // registra no buffer circular de latências
+            sort_lat_buf[sort_lat_buf_idx++] = latency_us;
+            if (sort_lat_buf_idx >= LAT_BUFFER_SIZE) sort_lat_buf_idx = 0;
+            if (latency_us > sort_max_lat) sort_max_lat = latency_us;
+
+            // registra entrada no event_log (para análise posterior)
+            event_log_entry_t entry = {
+                .seq = monitor_seq,
+                .timestamp_evt_us = ev.t_evt_us,
+                .timestamp_task_start = t_task_start,
+                .timestamp_task_end = 0,
+                .pad = ev.pad
+            };
+            event_log[event_log_head] = entry;
+            size_t this_event_index = event_log_head;
+            event_log_head = (event_log_head + 1) % EVENT_LOG_SIZE;
+
+            // simula processamento
+            int64_t t1 = esp_timer_get_time();
+            cpu_tight_loop_us(500);
+            int64_t t2 = esp_timer_get_time();
+
+            if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
+                cpu_time.sort_time_us += (t2 - t1);
+                stats.sort_lat_total_us += latency_us;
+                stats.sort_lat_count++;
+                xSemaphoreGive(mutexStats);
+            }
+
+            // marca fim do processamento
+            int64_t t_task_end = esp_timer_get_time();
+            event_log[this_event_index].timestamp_task_end = t_task_end;
+
+            // Atualiza (m,k)-firm: consideramos "deadline cumprida" se latency_us < deadline_us
+            const int64_t deadline_us = 20000; // exemplo: 20ms deadline (ajuste conforme necessidade)
+            int met = latency_us <= deadline_us ? 1 : 0;
+            // atualiza sliding window mk_sort
+            mk_sort.count_true -= mk_sort.window[mk_sort.idx];
+            mk_sort.window[mk_sort.idx] = met;
+            mk_sort.count_true += met;
+            mk_sort.idx = (mk_sort.idx + 1) % MK_K;
+
+            // opcional: print
+            printf("SORT_ACT: pad=%d evt=%lld start=%lld end=%lld lat=%lld us met=%d\n",
+                ev.pad, (long long)event_log[this_event_index].seq,
+                (long long)event_log[this_event_index].timestamp_task_start,
+                (long long)event_log[this_event_index].timestamp_task_end,
+                (long long)latency_us, met);
+        }
+    }
 }
 
-// ===== Task: SAFETY (E-stop) =====
+
+// ===== Task: SAFETY (modificado) =====
 static void task_safety(void *arg)
 {
-	safety_evt_t ev;
-	for (;;) {
-		if (xQueueReceive(qSafety, &ev, portMAX_DELAY) == pdTRUE) {
-			if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
-				stats.safety_events++;
-				int64_t t_start = esp_timer_get_time();
+    safety_evt_t ev;
+    for (;;) {
+        if (xQueueReceive(qSafety, &ev, portMAX_DELAY) == pdTRUE) {
+            int64_t t_task_start = esp_timer_get_time();
 
-				// Latência ISR -> task
-				int64_t latency_us = t_start - ev.t_evt_us;
-				stats.safety_lat_total_us += latency_us;
-				stats.safety_lat_count++;
-                if (latency_us > max_safety_lat_us) {
-                    max_safety_lat_us = latency_us;
-                }
+            if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
+                stats.safety_events++;
+                xSemaphoreGive(mutexStats);
+            }
 
-				int64_t t1 = esp_timer_get_time();
-				cpu_tight_loop_us(800);
-				int64_t t2 = esp_timer_get_time();
-				cpu_time.safety_time_us += (t2 - t1);
+            int64_t latency_us = t_task_start - ev.t_evt_us;
 
-				printf("SAFETY: E-STOP acionado @ %lld -> motor parado (lat=%lld us)\n",
-					(long long)t_start, (long long)latency_us);
-				
-				xSemaphoreGive(mutexStats);
-			}
+            safety_lat_buf[safety_lat_buf_idx++] = latency_us;
+            if (safety_lat_buf_idx >= LAT_BUFFER_SIZE) safety_lat_buf_idx = 0;
+            if (latency_us > safety_max_lat) safety_max_lat = latency_us;
 
-			if (xSemaphoreTake(mutexBeltState, portMAX_DELAY) == pdTRUE) {
-				// Ação de emergência
-				g_belt.rpm = 0.f;
-				// Configura o setpoint para zero para que o controlador pare imediatamente
-                g_belt.set_rpm = 0.f; 
-				estop_ativo = true;
-				xSemaphoreGive(mutexBeltState);
-			}
-		}
-	}
+            // log event
+            event_log_entry_t entry = {
+                .seq = monitor_seq,
+                .timestamp_evt_us = ev.t_evt_us,
+                .timestamp_task_start = t_task_start,
+                .timestamp_task_end = 0,
+                .pad = ev.pad
+            };
+            event_log[event_log_head] = entry;
+            size_t this_event_index = event_log_head;
+            event_log_head = (event_log_head + 1) % EVENT_LOG_SIZE;
+
+            int64_t t1 = esp_timer_get_time();
+            cpu_tight_loop_us(800);
+            int64_t t2 = esp_timer_get_time();
+
+            if (xSemaphoreTake(mutexStats, portMAX_DELAY) == pdTRUE) {
+                cpu_time.safety_time_us += (t2 - t1);
+                stats.safety_lat_total_us += latency_us;
+                stats.safety_lat_count++;
+                xSemaphoreGive(mutexStats);
+            }
+
+            int64_t t_task_end = esp_timer_get_time();
+            event_log[this_event_index].timestamp_task_end = t_task_end;
+
+            // (m,k)-firm update for safety (example)
+            const int64_t deadline_us = 30000; // custom
+            int met = latency_us <= deadline_us ? 1 : 0;
+            mk_safety.count_true -= mk_safety.window[mk_safety.idx];
+            mk_safety.window[mk_safety.idx] = met;
+            mk_safety.count_true += met;
+            mk_safety.idx = (mk_safety.idx + 1) % MK_K;
+
+            // action: set rpm to 0 as before
+            if (xSemaphoreTake(mutexBeltState, portMAX_DELAY) == pdTRUE) {
+                g_belt.rpm = 0.f;
+                g_belt.set_rpm = 0.f;
+                estop_ativo = true;
+                xSemaphoreGive(mutexBeltState);
+            }
+
+            printf("SAFETY: triggered start=%lld end=%lld lat=%lld us met=%d\n",
+                (long long)event_log[this_event_index].timestamp_task_start,
+                (long long)event_log[this_event_index].timestamp_task_end,
+                (long long)latency_us, met);
+        }
+    }
 }
 
 // ===== ISR Touch (Sem alterações, pois já usa lógica de fila/spinlock) =====
