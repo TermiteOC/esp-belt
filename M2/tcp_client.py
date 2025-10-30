@@ -3,59 +3,65 @@ import json
 import time
 
 # --- Configuração ---
-ESP_IP = "IP da esp (esp_netif_handler)"  # Coloque o IP do seu ESP32
+ESP_IP = "192.168.18.21"  # Coloque o IP do seu ESP32
 PORT   = 10420            # Porta TCP definida no ESP32
 
-# Lista dos comandos a serem testados
-COMMANDS_TO_TEST = [
-    "status",               # Pede o estado atual da esteira
-    "estop_on",             # Aciona o E-stop
-    "status",               # Verifica o estado (RPM deve ser 0.0, estop_ativo=true)
-    "set_rpm 150.0",        # Define um novo setpoint, o que deve resetar a flag do E-stop
-    "status",               # Verifica o estado (RPM deve estar subindo)
-    "set_rpm 120.0",        # Define setpoint de volta para o padrão
-    "status",               # Verifica o estado (RPM deve estar descendo)
-    "estop_reset",          # Comando auxiliar (set_rpm 120.0)
-    "status",               # Última verificação
-]
-
-print(f"Cliente TCP ativo. Endereço do Servidor ESP: {ESP_IP}:{PORT}")
-print("==========================================================")
+print(f"--- CLIENTE TCP INTERATIVO ---")
+print(f"Conectando a {ESP_IP}:{PORT}...")
+print("Digite 'sair' para fechar.")
+print("==================================================")
 
 try:
     # Cria e conecta o socket TCP (com timeout de 5s)
     with socket.create_connection((ESP_IP, PORT), timeout=5) as s:
-        # Recebe e imprime a mensagem de boas-vindas do servidor (opcional)
+        # Recebe e imprime a mensagem de boas-vindas
         initial_data = s.recv(1024).decode()
-        print(f"ESP> Conexão Estabelecida. Boas-vindas:\n{initial_data.strip()}")
+        print(f"ESP> {initial_data.strip()}\n")
+        
+        rtt_samples = []
 
-        for msg in COMMANDS_TO_TEST:
+        while True:
+            msg = input("Comando TCP > ").strip()
+            if msg.lower() == 'sair':
+                break
+            if not msg:
+                continue
+
             # Envia a mensagem com nova linha (\n) no final
             command_to_send = (msg.strip() + "\n").encode()
+            
+            # --- MEDIÇÃO DE RTT INÍCIO ---
+            t_start = time.perf_counter()
+            
             s.sendall(command_to_send)
-            print(f"PC > Sent: {msg}")
 
             # Aguarda e recebe a resposta do servidor
             data = s.recv(1024).decode().strip()
-            print(f"ESP> Received: {data}")
-
-            # Tenta decodificar e imprimir o JSON
-            try:
-                # O servidor ESP32 envia JSON, vamos decodificá-lo
-                json_data = json.loads(data)
-                print("JSON:", json_data)
-            except json.JSONDecodeError:
-                print("JSON: Não decodificado (resposta não JSON ou erro de formatação).")
-                pass
             
-            # Pequena pausa para simular a interação humana e observar as rampas de RPM
-            time.sleep(1) 
+            t_end = time.perf_counter()
+            # --- MEDIÇÃO DE RTT FIM ---
+            
+            rtt_ms = (t_end - t_start) * 1000.0
+            rtt_samples.append(rtt_ms)
+            
+            print(f"ESP> {data}")
+            print(f"(RTT: {rtt_ms:.2f} ms)\n")
+
 
 except ConnectionRefusedError:
-    print(f"\nErro: Conexão recusada para {ESP_IP}:{PORT}. Verifique se o ESP32 está conectado e se o Servidor TCP está rodando.")
+    print(f"\nErro: Conexão recusada. Verifique o IP e se a ESP32 está em modo TCP.")
 except socket.timeout:
-    print(f"\nErro: Tempo limite de conexão esgotado para {ESP_IP}:{PORT}. Verifique o IP e a conectividade de rede.")
+    print(f"\nErro: Tempo limite de conexão esgotado.")
 except Exception as e:
     print(f"\nUm erro ocorreu: {e}")
 
 print("Fechando o socket TCP...")
+
+# --- ANÁLISE FINAL DO RTT ---
+if rtt_samples:
+    print("\n================= ANÁLISE DE RTT (TCP) =================")
+    print(f"Comandos enviados: {len(rtt_samples)}")
+    print(f"Latência Mínima:   {min(rtt_samples):.2f} ms")
+    print(f"Latência Média:    {sum(rtt_samples) / len(rtt_samples):.2f} ms")
+    print(f"Latência Máxima:   {max(rtt_samples):.2f} ms")
+    print("==========================================================")
