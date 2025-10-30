@@ -37,7 +37,6 @@ def listener_thread(sock):
                 
                 if data_str:
                     print(f"\n--- Relatório de Performance Recebido (Seq: {json.loads(data_str).get('seq')}) ---")
-                    #print(data_str) # Descomente se quiser o log completo no console
                     log_file.write(data_str + "\n")
                     log_file.flush()
                     try:
@@ -54,7 +53,6 @@ def listener_thread(sock):
     print("Thread de escuta encerrada.")
 
 # --- Função de Análise ---
-# Esta função é chamada pela thread principal
 def analisar():
     global relatorios
     if not relatorios:
@@ -63,7 +61,6 @@ def analisar():
 
     print("\n===== ANÁLISE DE PERFORMANCE (CPU/WCRT) =====")
     
-    # Copia a lista de relatórios de forma segura
     with relatorios_lock:
         relatorios_copia = list(relatorios)
     
@@ -130,4 +127,5 @@ finally:
         sock.close()
     if 'log_file' in locals():
         log_file.close()
+
     print("Coletor de logs encerrado.")
