@@ -1,74 +1,71 @@
-import socket, threading, time, select, json, statistics
+import socket
+import time
 
-ESP_IP = "10.15.0.235"
-PORT = 10421
-PC_IP = "10.15.0.146"
+# --- Configuração ---
+ESP_IP = "192.168.18.21"
+PORT   = 10421            # Porta de COMANDO UDP
+PC_IP  = "192.168.18.10"  # IP desta máquina
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", PORT))
-sock.setblocking(False)
+# Este script vai usar uma porta diferente (ex: 10422) para enviar
+# O Coletor de Logs (log_collector.py) deve estar rodando na 10421
+CLIENT_PORT = 10422 
 
-log_file = open("logs_esp32.txt", "a", encoding="utf-8")
-relatorios = []
+print(f"--- CLIENTE UDP INTERATIVO (COM RTT) ---")
+print(f"Enviando para {ESP_IP}:{PORT}")
+print("Digite 'sair' para fechar.")
+print("AVISO: Certifique-se que 'log_collector.py' está rodando em outro terminal.")
+print("==================================================")
 
-def display_full_report(data: str):
-    if data.strip():
-        print("\n--- Log recebido da ESP32 ---")
-        print(data)
-        log_file.write(data + "\n")
-        log_file.flush()
-        try:
-            j = json.loads(data)
-            if j.get("type") == "monitor_report":
-                relatorios.append(j)
-        except json.JSONDecodeError:
-            pass
+rtt_samples = []
 
-def listener():
-    """Thread que escuta relatórios e respostas da ESP."""
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Define um timeout de 2 segundos para o socket
+    sock.settimeout(2.0) 
+    # Binda a uma porta específica para que a ESP32 possa responder
+    sock.bind(("0.0.0.0", CLIENT_PORT)) 
+
     while True:
-        try:
-            r, _, _ = select.select([sock], [], [], 0.2)
-            if r:
-                data, _ = sock.recvfrom(4096)
-                display_full_report(data.decode(errors="ignore").strip())
-        except Exception as e:
-            print("Erro no listener:", e)
-
-def analisar():
-    if not relatorios:
-        print("Nenhum relatório recebido ainda.")
-        return
-
-    lat_sort = [r["sort"]["avg_lat_us"] for r in relatorios]
-    lat_safety = [r["safety"]["avg_lat_us"] for r in relatorios]
-    cpu = [r["cpu_usage_pct"] for r in relatorios]
-
-    print("\n===== ANÁLISE DOS RELATÓRIOS =====")
-    def resumo(nome, dados):
-        if dados:
-            print(f"{nome}: média={statistics.mean(dados):.2f} µs | máx={max(dados):.2f} | mediana={statistics.median(dados):.2f}")
-            if len(dados) > 10:
-                print(f"   95º percentil = {statistics.quantiles(dados, n=100)[94]:.2f} µs")
-
-    resumo("SORT_ACT", lat_sort)
-    resumo("SAFETY", lat_safety)
-    print(f"CPU usage médio = {statistics.mean(cpu):.2f}% (máx {max(cpu):.2f}%)")
-
-def sender():
-    """Thread que lê comandos do teclado e envia para ESP."""
-    while True:
-        cmd = input("\nDigite comando (status, estop_on, estop_reset, set_rpm X, ping, analisar, sair): ").strip()
-        if cmd.lower() in ("exit", "sair"):
-            print("Encerrando cliente...")
-            sock.close()
-            log_file.close()
+        msg = input("Comando UDP > ").strip()
+        if msg.lower() == 'sair':
             break
-        elif cmd.lower() == "analisar":
-            analisar()
-        else:
-            sock.sendto((cmd + "\n").encode(), (ESP_IP, PORT))
+        if not msg:
+            continue
 
-print(f"Cliente UDP ativo em {PC_IP}:{PORT} → ESP {ESP_IP}:{PORT}")
-threading.Thread(target=listener, daemon=True).start()
-sender()
+        command_to_send = (msg + "\n").encode()
+        
+        # --- MEDIÇÃO DE RTT INÍCIO ---
+        t_start = time.perf_counter()
+        
+        sock.sendto(command_to_send, (ESP_IP, PORT))
+
+        try:
+            # Aguarda a resposta (bloqueante, com timeout)
+            data, addr = sock.recvfrom(1024)
+            
+            t_end = time.perf_counter()
+            # --- MEDIÇÃO DE RTT FIM ---
+            
+            rtt_ms = (t_end - t_start) * 1000.0
+            rtt_samples.append(rtt_ms)
+            
+            print(f"ESP> {data.decode().strip()}")
+            print(f"(RTT: {rtt_ms:.2f} ms)\n")
+            
+        except socket.timeout:
+            print("Erro: Nenhuma resposta recebida do ESP32 (Timeout).\n")
+
+except Exception as e:
+    print(f"\nUm erro ocorreu: {e}")
+
+print("Fechando o socket UDP...")
+sock.close()
+
+# --- ANÁLISE FINAL DO RTT ---
+if rtt_samples:
+    print("\n================= ANÁLISE DE RTT (UDP) =================")
+    print(f"Comandos enviados: {len(rtt_samples)}")
+    print(f"Latência Mínima:   {min(rtt_samples):.2f} ms")
+    print(f"Latência Média:    {sum(rtt_samples) / len(rtt_samples):.2f} ms")
+    print(f"Latência Máxima:   {max(rtt_samples):.2f} ms")
+    print("==========================================================")
